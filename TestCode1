@@ -1,0 +1,296 @@
+global class EV_PaymentConfirmation implements Database.Batchable<sObject>, Database.Stateful{
+    //----------------------------------------------------------------------------
+    // bxne - Class to update Payment records from confirmation file received from SAP
+    // 7/15/16 - Initial version.      
+    // bxne - 10/25/2019 - Cse 318858 - Fixed API version change issue, added SAP to EI date in soql query. 
+    //----------------------------------------------------------------------------
+
+    global string totalCount = '0';
+    global string totalAmount = '0.0';
+    global string sourceFile='';
+    global integer count =0;
+    global string headerForExcel = 'APPLICATION NUMBER\t CHECK NUMBER\t PAYABLE TO\t AMOUNT\t CHECK STATUS\t CHECK ISSUE DT\t CHECK STOPPED DT\t DOCUMENT NUMBER\n';
+    global string finalExcelStr = headerForExcel;
+    global string recordString;
+    global EV_PaymentUtility paymentUtility = new EV_PaymentUtility();
+
+    //Start Method
+    global Database.QueryLocator start(Database.BatchableContext BC){
+        Date processStartDate = system.today().addDays(-7);
+        //  String query = 'SELECT Id, name, Record_Details_EI__c, Processed_EI__c from EI_EV_Payment_Confirmation_Staging__c where createddate > LAST_WEEK and Processed_EI__c != true';
+        String query = 'SELECT Id, name, Record_Details_EI__c, Processed_EI__c from EI_EV_Payment_Confirmation_Staging__c where  createddate > : processStartDate and Processed_EI__c != true';
+
+        return Database.getQueryLocator(query);
+    }
+
+    //Execute logic to read Payment records and create data in text file format and insert into 
+    //Payment staging object.
+    global void execute(Database.BatchableContext BC, List<EI_EV_Payment_Confirmation_Staging__c>lstStaging){
+        system.debug('@@@@.... here');
+
+        try{
+            //map to hold staging detail for Application Numbers                        
+            map<string,string>mapApplicationStaging = new map<string,string>();
+            //map to hold staging detail for Check Numbers
+            map<string,string>mapCheckStaging = new map<string,string>();
+            //Create a new instance of the Log Handler class
+
+            string strCheckStatus = '';
+            for(EI_EV_Payment_Confirmation_Staging__c staging : lstStaging){
+                system.debug('@@@@.... here in for loop');
+                string strApplicationNumber = '';
+                boolean checkKey = false;
+                staging.Processed_EI__c = True;
+                //Record type = 001
+                if(staging.Record_Details_EI__c.startsWith('001')){
+                    sourceFile = staging.Record_Details_EI__c;
+                }
+                //Record type = 002
+                if(staging.Record_Details_EI__c.startsWith('002')){
+                    //If Appliction/Reference field is blank then check cancellation info is supplied
+                    if(staging.Record_Details_EI__c.length() > 14 && string.isNotBlank(staging.Record_Details_EI__c.substring(3, 13))) {
+                        //Get Application# from 3 to 13 (total 10 diigits) and update Map.
+                        strApplicationNumber = staging.Record_Details_EI__c.substring(3, 13);
+                        mapApplicationStaging.put(strApplicationNumber,staging.Record_Details_EI__c);
+                        system.debug ('@@@___ application number: '+strApplicationNumber);
+                        checkKey = true;
+                    }
+                    if(staging.Record_Details_EI__c.length() > 40 &&  string.isNotBlank(staging.Record_Details_EI__c.substring(27, 39)) && !checkKey) {
+                        strApplicationNumber = staging.Record_Details_EI__c.substring(27, 39).trim();
+                        system.debug ('@@@___ check number: '+strApplicationNumber);
+                        // mapCheckStaging.put(string.valueOf(strApplicationNumber),staging.Record_Details_EI__c);
+                        mapApplicationStaging.put(string.valueOf(strApplicationNumber),staging.Record_Details_EI__c);
+                    }
+                }
+                //Record type = 999
+                if(staging.Record_Details_EI__c.startsWith('999')){
+                    if(staging.Record_Details_EI__c.length() > 13 && string.isNotBlank(staging.Record_Details_EI__c.substring(3, 11))) {
+                        totalCount = staging.Record_Details_EI__c.substring(3, 11);
+                    }
+                    if(staging.Record_Details_EI__c.length() > 28 && string.isNotBlank(staging.Record_Details_EI__c.substring(12, 27))) {
+                        totalAmount = staging.Record_Details_EI__c.substring(12, 27);
+                    }
+                }
+            }
+            system.debug('@@@___'+mapApplicationStaging.keySet());
+            map<string,string>mapApplicationStatus = new map<string,string>();
+            if(!mapApplicationStaging.isEmpty() || !mapCheckStaging.isEmpty()){
+                string mapStagingKey, mapStagingValue;
+                //   list<EI_EV_Payment__c>lstPayment = [select Id, EV_Application_EI__r.Application_Number_EI__c, Check_Stopped_Date_EI__c,Invoice_Date_EI__c,Check_Number_EI__c,Check_Issue_Date_EI__c,Check_Amount_EI__c, Check_Payable_To_EI__c,Check_Status_EI__c,Document_Number_EI__c FROM EI_EV_Payment__c where EV_Application_EI__r.Application_Number_EI__c IN : mapApplicationStaging.keyset() OR Check_Number_EI__c IN : mapCheckStaging.keyset() ];
+                //     list<EI_EV_Payment__c>lstPayment = [select Id, EV_Application_EI__r.Application_Number_EI__c, Check_Stopped_Date_EI__c,Invoice_Date_EI__c,Check_Number_EI__c,Check_Issue_Date_EI__c,Check_Amount_EI__c, Check_Payable_To_EI__c,Check_Status_EI__c,Document_Number_EI__c FROM EI_EV_Payment__c where SAP_to_EI_Date_EI__c = null AND (EV_Application_EI__r.Application_Number_EI__c IN : mapApplicationStaging.keyset() OR Check_Number_EI__c IN : mapApplicationStaging.keyset()) ];
+                list<EI_EV_Payment__c>lstPayment = [select Id, EV_Application_EI__r.Application_Number_EI__c, SAP_to_EI_Date_EI__c, Check_Stopped_Date_EI__c,Invoice_Date_EI__c,Check_Number_EI__c,Check_Issue_Date_EI__c,Check_Amount_EI__c, Check_Payable_To_EI__c,Check_Status_EI__c,Document_Number_EI__c FROM EI_EV_Payment__c where Check_Status_EI__c != 'Stopped/Cancelled' AND (EV_Application_EI__r.Application_Number_EI__c IN : mapApplicationStaging.keyset() OR Check_Number_EI__c IN : mapApplicationStaging.keyset()) ];
+
+                system.debug('@@@___Payment List size '+ lstPayment.size());
+                if(!lstPayment.isEmpty()){
+                    system.debug('@@@___List size '+ lstPayment.size());
+
+                    decimal amountVal =0;
+                    for(EI_EV_Payment__c payment : lstPayment){
+                        // system.debug('$$$___Processing Application # : '+ payment.EV_Application_EI__r.Application_Number_EI__c);
+                        count++;
+                        system.debug('HERE IN BEFORE MAIN LOOP');
+                        //|| mapApplicationStaging.containsKey(payment.Check_Number_EI__c)
+                        if(mapApplicationStaging.containsKey(payment.EV_Application_EI__r.Application_Number_EI__c) || mapApplicationStaging.containsKey(payment.Check_Number_EI__c)){
+                            //fetch and update document number
+                            system.debug('HERE IN MAIN LOOP');
+                            system.debug('BEFORE LOOP');
+
+                            mapStagingValue = mapApplicationStaging.get(payment.EV_Application_EI__r.Application_Number_EI__c);
+                            mapStagingKey = payment.EV_Application_EI__r.Application_Number_EI__c;
+                            system.debug('#####....VAL 1 is : '+mapStagingValue);
+                            IF (mapStagingValue == null || mapStagingValue=='') {
+                                // If LookUp based on Application Number is null then LookUp based on Check Number!
+                                mapStagingValue =  mapApplicationStaging.get(payment.Check_Number_EI__c);
+                                mapStagingKey   =  payment.Check_Number_EI__c;
+                            }
+                            // } else {
+                            //    val =  mapApplicationStaging.get(payment.EV_Application_EI__r.Application_Number_EI__c);
+                            // }
+                            system.debug('AFTER LOOP');
+                            system.debug('#####...App or Check # : '+mapStagingValue);
+                            if (mapStagingValue.length() >= 118) {
+                                payment.Document_Number_EI__c = mapStagingValue.substring(108, 118).trim();
+                                system.debug('$$$___Document_Number_EI__c '+ payment.Document_Number_EI__c);
+                            }
+
+                            system.debug ('#####Status value in Map : '+mapStagingValue.substring(107, 108).trim());
+                            if(mapStagingValue.length() >= 108){
+                                //payment.Check_Status_EI__c = mapStagingValue.substring(107, 108).trim();
+                                strCheckStatus  = mapStagingValue.substring(107, 108).trim();
+                                system.debug('here....');
+                                system.debug('$$$___strCheck_Status_EI__c '+ strCheckStatus  );
+                                mapApplicationStatus.put(payment.EV_Application_EI__r.Application_Number_EI__c,strCheckStatus  );
+                            }
+
+                            if(mapStagingValue.length() >= 107){
+                                payment.Check_Payable_To_EI__c = mapStagingValue.substring(72, 106).trim();
+                                system.debug('$$$___Check_Payable_To_EI__c  '+ payment.Check_Payable_To_EI__c );
+                            }
+
+                            if(mapStagingValue.length() >= 62){
+                                payment.Check_Amount_EI__c = decimal.valueOf(mapStagingValue.substring(48, 61).trim());
+                                amountVal = amountVal+decimal.valueOf(mapStagingValue.substring(48, 61).trim());
+                                system.debug('$$$Check_Amount_EI__c  '+ payment.Check_Amount_EI__c );
+                            }
+                            if(mapStagingValue.length() >= 48){
+                                string dateStr = mapStagingValue.substring(40, 48).trim();
+                                Date issueDate = date.parse(dateStr.substring(0,2)+'/'+dateStr.substring(2,4)+'/'+dateStr.substring(4,8));
+                                payment.Check_Issue_Date_EI__c = issueDate;
+                                system.debug('$$$Check_Issue_Date_EI__c  '+ payment.Check_Issue_Date_EI__c );
+                            }
+
+                            if(mapStagingValue.length() >= 40){
+                                payment.Check_Number_EI__c = string.valueOf(mapStagingValue.substring(27,39).trim());
+                                system.debug('$$$Check_Number_EI__c  '+ payment.Check_Number_EI__c );
+                            }
+
+                            if(mapStagingValue.length() >= 27){
+                                // if(string.isNotBlank(payment.Check_Status_EI__c) && payment.Check_Status_EI__c == 'I'){
+
+                                if(string.isNotBlank(strCheckStatus  ) && strCheckStatus  == 'I') {
+                                    string dateStr1 = mapStagingValue.substring(19,27).trim();
+                                    Date invoiceDate = date.parse(dateStr1.substring(0,2)+'/'+dateStr1.substring(2,4)+'/'+dateStr1.substring(4,8));
+                                    payment.Invoice_Date_EI__c = invoiceDate;
+                                    payment.Check_Status_EI__c = 'Paid';
+                                    system.debug('$$$___invoiceDate '+ invoiceDate);
+                                }
+                                //  if(string.isNotBlank(payment.Check_Status_EI__c) && payment.Check_Status_EI__c == 'C'){
+                                if(string.isNotBlank(strCheckStatus  ) && strCheckStatus  == 'C') {
+                                    string dateStr1 = mapStagingValue.substring(19,27).trim();
+                                    Date stoppedDate = date.parse(dateStr1.substring(0,2)+'/'+dateStr1.substring(2,4)+'/'+dateStr1.substring(4,8));
+                                    payment.Check_Stopped_Date_EI__c = stoppedDate;
+                                    payment.Check_Status_EI__c = 'Stopped/Cancelled';
+                                    system.debug('$$$____stoppedDate '+ stoppedDate);
+                                }
+                            }
+                        }
+
+                        system.debug('$$$____Check status '+ payment.Check_Status_EI__c);
+                        if (payment.SAP_to_EI_Date_EI__c == null)
+                            payment.SAP_to_EI_Date_EI__c = system.today();
+                        recordString = payment.EV_Application_EI__r.Application_Number_EI__c+'\t'+payment.Check_Number_EI__c+'\t'+payment.Check_Payable_To_EI__c+'\t'+payment.Check_Amount_EI__c +'\t'+payment.Check_Status_EI__c+'\t'+payment.Check_Issue_Date_EI__c+'\t'+payment.Check_Stopped_Date_EI__c+'\t'+payment.Document_Number_EI__c+'\n';
+                        finalExcelStr = finalExcelStr + recordString;
+
+                    }
+                }
+                
+            system.debug ('@@@@...mapApplicationStatus Count : ... :'+ mapApplicationStatus.size());
+            if(!mapApplicationStatus.isEmpty()){
+                list<EI_EV_Application__c>lstApplication = [select id,Application_Status_EI__c,Application_Number_EI__c from EI_EV_Application__c where Application_Number_EI__c IN : mapApplicationStatus.keyset()];
+                if(!lstApplication.isEmpty()){
+
+                    // Approval.UnLockResult[] lrList = Approval.unlock(lstApplication, false);
+                    for(EI_EV_Application__c application : lstApplication){
+                        system.debug ('@@@@...mapApplicationStatus for loop : ... :'+ application.Application_Number_EI__c);
+                        if(mapApplicationStatus.get(application.Application_Number_EI__c) == 'I')
+                            application.Application_Status_EI__c = 'Paid';
+                        if(mapApplicationStatus.get(application.Application_Number_EI__c) == 'C')
+                            application.Application_Status_EI__c = 'Cancelled';
+                    }
+                    system.debug ('@@@@...Number of Application to Update : ... :'+ lstApplication.size());
+                    update lstApplication;
+
+                    //Update staging record with Processed flag = true
+                    update lstStaging;
+
+                    //delete 30 days older staging records!
+                    List<EI_EV_Payment_Confirmation_Staging__c>lstdeleteStaging = [select id, createdDate from EI_EV_Payment_Confirmation_Staging__c where CreatedDate < LAST_N_DAYS:30];
+                    delete lstdeleteStaging;
+
+                }
+            }           
+                
+                //     Database.SaveResult[] paymentList = database.update(lstPayment,false);
+                List<Database.SaveResult> insertResults = Database.update(lstPayment, false);
+                //Database.SaveResult will not throw Exception error so loop and check error condition. Call Payment utility to log errors, if any!
+                //01132017 - paymentUtility.logDataBaseSaveResultError(insertResults, 'Payment: '+'EI_EV_Payment__c' );
+
+                //        List<Database.SaveResult> insertResults = Database.insert(lstPayment, false);
+                Set<Id> successIds = new Set<Id>();
+                for (Database.SaveResult insertResult : insertResults) {
+                    if (insertResult.isSuccess()) {
+                        successIds.add(insertResult.getId());
+                    }
+                }
+                List<EI_EV_Payment__c > successLineItems = new List<EI_EV_Payment__c >();
+                List<EI_EV_Payment__c > failedLineItems = new List<EI_EV_Payment__c >();
+                for (EI_EV_Payment__c li : lstPayment) {
+                    if (successIds.contains(li.Id)) {
+                        successLineItems.add(li);
+                    } else {
+                        failedLineItems.add(li);
+                        system.debug('@@@____FAILED ID: '+ li.id + ' / '+ li.EV_Application_EI__r.Application_Number_EI__c);
+                        //01132017 paymentUtility.addPaymentLog('EV PAYMENT CONFIRMATION PROCESS ERROR IN DATABASE.UPDATE',
+                        //        'FAILED RECORD ID: '+ li.id + ' / '+ li.EV_Application_EI__r.Application_Number_EI__c,
+                        //        'Detail', 0, 0);
+                        //paymentUtility.upsertPaymentLog();
+                    }
+                }
+
+            }
+            /*
+            system.debug ('@@@@...mapApplicationStatus Count : ... :'+ mapApplicationStatus.size());
+            if(!mapApplicationStatus.isEmpty()){
+                list<EI_EV_Application__c>lstApplication = [select id,Application_Status_EI__c,Application_Number_EI__c from EI_EV_Application__c where Application_Number_EI__c IN : mapApplicationStatus.keyset()];
+                if(!lstApplication.isEmpty()){
+
+                    // Approval.UnLockResult[] lrList = Approval.unlock(lstApplication, false);
+                    for(EI_EV_Application__c application : lstApplication){
+                        system.debug ('@@@@...mapApplicationStatus for loop : ... :'+ application.Application_Number_EI__c);
+                        if(mapApplicationStatus.get(application.Application_Number_EI__c) == 'I')
+                            application.Application_Status_EI__c = 'Paid';
+                        if(mapApplicationStatus.get(application.Application_Number_EI__c) == 'C')
+                            application.Application_Status_EI__c = 'Cancelled';
+                    }
+                    system.debug ('@@@@...Number of Application to Update : ... :'+ lstApplication.size());
+                    update lstApplication;
+
+                    //Update staging record with Processed flag = true
+                    update lstStaging;
+
+                    //delete 30 days older staging records!
+                    List<EI_EV_Payment_Confirmation_Staging__c>lstdeleteStaging = [select id, createdDate from EI_EV_Payment_Confirmation_Staging__c where CreatedDate < LAST_N_DAYS:30];
+                    delete lstdeleteStaging;
+
+                }
+            }
+            */
+            system.debug('@@@...count: '+count);
+            if(string.isNotBlank(totalAmount) && string.isNotBlank(totalCount)){
+               // EI_Interface_Upload_Result__c uploadResult = new EI_Interface_Upload_Result__c();
+               // uploadResult.Source_File_EI__c =sourceFile;
+               // uploadResult.Number_of_Successes_EI__c= (count == integer.valueof(totalCount)) ? integer.valueof(totalCount) : 0;
+               // uploadResult.Number_of_Invalid_Records_EI__c = (count == integer.valueof(totalCount)) ? 0: integer.valueof(totalCount);
+               // uploadResult.Total_Number_of_Records_EI__c = integer.valueof(totalCount);
+            }
+
+
+        }
+        catch(exception e){
+            system.debug('@@@___'+e.getMessage());
+        }
+    }
+
+    //finish logic
+    global void finish(Database.BatchableContext BC) {
+
+        //EV_PaymentUtility paymentUtility = new EV_PaymentUtility();
+        string strEmailList = system.label.EV_ConfirmationEmailList;
+        string strEmailSubject = 'EV Payment Confirmation File Processed';
+        string strEmailBody;
+        string fileName = 'EV_SAPTOEI_' + Datetime.now().format('MM-dd-YYYY') + '.xls';
+        //filename = fileName + Datetime.now().format('MM-dd-YYYY') + '.csv';
+        if (count != 0) {
+            strEmailBody = ('Attached file has the details of Check Info updated through Confirmation file received from SAP on :'+string.valueof(Datetime.now().format('MM-dd-YYYY\' \'HH:mm:ss'))+'<br/><br>' +
+                    'Total applications updated:   '+ count + '<br/><br>' +
+                    'Total check amount in SAP file:  '+ totalAmount + '<br/><br><br>'
+            );
+        } else {
+            strEmailBody = ('There are no applications to process in this batch on: ' + string.valueof(Datetime.now().format('MM-dd-YYYY\' \'HH:mm:ss'))+'<br/><br>');
+        }
+
+        paymentUtility.sendEmailWithAttachment(strEmailList, strEmailSubject, strEmailBody, finalExcelStr, fileName, true );
+
+        System.debug('*****Batch Job Completed*****');
+    }
+}
